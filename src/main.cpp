@@ -353,25 +353,6 @@ void handleSongInfo(SongInfo *songInfoToHandle) {
     leftHanded = songInfoToHandle->leftHanded;
 }
 
-
-void getReplayValues(std::string str) {
-    rightPositions.clear();
-    rightRotations.clear();
-    leftPositions.clear();
-    leftRotations.clear();
-    headPositions.clear();
-    scores.clear();
-    times.clear();
-    energies.clear();
-    combos.clear();
-    ranks.clear();
-    for (unsigned i = 0; i < str.length(); i += 80) {
-        std::string toDeserialize = str.substr(i, 80);
-        auto deserialized = cista::deserialize<ReplayLine>(toDeserialize);
-        handleReplayLine(deserialized);
-    }
-}
-
 void onIncomingMsg(std::string msg) {
     auto packet = cista::deserialize<Packet>(msg);
     if (packet->type == 1) {
