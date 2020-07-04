@@ -10,8 +10,8 @@
             ],
             "includePath": [
                 "${workspaceFolder}/**",
-                "c:/Program Files/Unity/Hub/Editor/2019.3.2f1/Editor/Data/il2cpp/libil2cpp",
-                "c:/Users/henwi/Desktop/ModdingBeatSaber/android-ndk-r20b/android-ndk-r20/**"
+                "D:/Unity/Editors/2019.3.2f1/Editor/Data/il2cpp/libil2cpp",
+                "C:/Users/jordh/Documents/ndk/android-ndk-r20/**"
             ],
             "cStandard": "c11",
             "cppStandard": "c++20",

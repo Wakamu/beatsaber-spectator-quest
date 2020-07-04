@@ -2,12 +2,17 @@
 #include "../extern/beatsaber-hook/shared/utils/utils.h"
 #include "../extern/beatsaber-hook/shared/utils/logging.hpp"
 #include "../extern/beatsaber-hook/include/modloader.hpp"
+#include "../include/nix_tcp.hpp"
 #include "../extern/beatsaber-hook/shared/utils/typedefs.h"
 #include "../extern/beatsaber-hook/shared/utils/il2cpp-utils.hpp"
 #include "../extern/beatsaber-hook/shared/utils/il2cpp-functions.hpp"
 #include "../extern/beatsaber-hook/shared/config/rapidjson-utils.hpp"
 #include "../extern/beatsaber-hook/shared/config/config-utils.hpp"
 #include "../extern/BeatSaberQuestCustomUI/shared/customui.hpp"
+#include "../extern/tcp_server_client-0.1/include/tcp_server.h"
+#include "../extern/tcp_server_client-0.1/include/tcp_client.h"
+#include "../extern/cista/cista.h"
+#include "../extern/sha1/sha1.h"
 #include <sstream>
 #include <iostream>
 #include <cstdlib>
@@ -17,11 +22,46 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <cmath>
+#include <thread>
 using namespace il2cpp_utils;
 
-void log(std::string str) {
-    Logger::get().info(str);
-}
+namespace cistadata = cista::raw;
+
+struct ReplayLine { //ReplayLine And SongInfo Have To be the same size
+    Vector3 rightPosition;
+    Vector3 rightRotation;
+    Vector3 leftPosition;
+    Vector3 leftRotation;
+    Vector3 headPosition;
+    int score;
+    int combo;
+    float time;
+    float energy;
+    float rank;
+};
+
+struct SongInfo { //ReplayLine And SongInfo Have To be the same size
+    bool batteryEnergy;
+    bool disappearingArrows;
+    bool noObstacles;
+    bool noBombs;
+    bool noArrows;
+    bool slowerSong;
+    bool noFail;
+    bool instafail;
+    bool ghostNotes;
+    bool fasterSong;
+    bool leftHanded;
+    int difficulty;
+    int mode;
+    cistadata::string SongHash; 
+};
+
+struct Packet { // The packet size should be exactly 104!
+    int type;
+    cistadata::string data;
+};
+
 
 class CustomButton {
     public:
@@ -152,11 +192,9 @@ class CustomButton {
         }
 };
 
-static CustomButton replayButton;
+static CustomButton spectateButton;
 
-static CustomButton speedToggle;
-
-CustomUI::TextObject replayText;
+CustomUI::TextObject spectateText;
 
 static ModInfo modInfo;
 
@@ -167,46 +205,73 @@ Configuration& getConfig() {
 
 Il2CppObject* playButton = nullptr;
 
+SongInfo currentSongInfo {0};
+
+size_t playingLevel = 0;
+
+bool shouldSkip = false;
+
+float skipTime = 0.0;
+
 bool recording = true;
+
+bool spectating = false;
+
+static bool threadStarted = false;
+
+TcpServer server;
+
+TcpSocket sck(104); // Size = 104
+
+bool waiting = false;
+int offset = 0;
+int spectatorPort = 0;
+int serverPort = 0;
+std::string spectatorIp;
+
+void SocketThread() {
+    pipe_ret_t startRet = server.start(serverPort);
+    if (startRet.success) {
+        while(1) {
+            Client client = server.acceptClient(0);
+            if (client.isConnected()) {
+                log("A new client connected!");
+                // TODO: REWORK AFTER NEW PACKET FORMAT
+                // if (currentSongInfo.SongHash0 > 0) {
+                //     std::vector<uint8_t> buf = cista::serialize(currentSongInfo);
+                //     std::string songInfoStr(buf.begin(), buf.end());
+                //     Packet packet{1, songInfoStr};
+                //     std::vector<uint8_t> bufPacket = cista::serialize(packet);
+                //     std::string packetStr(bufPacket.begin(), bufPacket.end());
+                //     server.sendToClient(client, packetStr.c_str(), packetStr.length());
+                // }
+            }
+        }
+    }
+}
 
 std::string ssEnabled = "0";
 bool firstTime = true;
 
-void replayButtonOnClick() {
-    if(fileexists("sdcard/Android/data/com.beatgames.beatsaber/files/mods/libScoreSaber.so")) {
-        setenv("disable_ss_upload", "1", true);
-    }
-    if(playButton != nullptr) {
-        recording = false;
-        RunMethod(playButton, "Press");
-    }
-}
-
-void speedToggleOnClick() {
-    speedToggle.toggle = !speedToggle.toggle;
-    
-    if(speedToggle.toggle) {
-        speedToggle.setText("Lock Speed - ON");
-    } else {
-        speedToggle.setText("Lock Speed - OFF");
-    }
+void onDisconnection(const pipe_ret_t & ret) {
+	log("Disconnected");
 }
 
 float songTime = 0.0f;
 bool inSong = false;
 bool inSongOrResults = false;
 
-int score;
+int score = 0;
 int highScore;
-std::string rank;
-float rankFloat;
+std::string rank ="100.0%";
+float rankFloat = 1;
 float scoreMultiplier = 1.0f;
 
 int combo = 0;
 
 bool inPracticeMode;
 
-float energy;
+float energy = 0.5f;
 
 std::vector<Vector3> rightPositions;
 std::vector<Vector3> rightRotations;
@@ -218,6 +283,8 @@ std::vector<int> combos;
 std::vector<float> times;
 std::vector<float> energies;
 std::vector<std::string> ranks;
+std::vector<ReplayLine> replayLines; //TODO: Remove all other vectors and only use this one!
+Il2CppObject* roomCenter = nullptr;
 
 std::string stringToSave;
 
@@ -226,8 +293,8 @@ Il2CppObject* scoreUI;
 int indexNum = 0;
 
 std::string songHash;
-
-std::string replayDirectory = "sdcard/Android/data/com.beatgames.beatsaber/files/replays/";
+int songDifficulty;
+int mode;
 
 bool batteryEnergy = false;
 bool disappearingArrows = false;
@@ -245,32 +312,47 @@ int triggerNode;
 float rTriggerVal;
 float lTriggerVal;
 
-bool inPauseMenu = false;
+bool playing = false;
 
 int amountPerLine = 20;
 
-float replaySpeed = 1.0f;
+int lineCount = 0;
 
 std::string songName = "";
 
-int offset = getConfig().config["Offset"].GetInt();
-
-void SaveConfig() {
-    if(!getConfig().config.HasMember("Offset")) {
-        log("Creating config");
-        getConfig().config.RemoveAllMembers();
-        getConfig().config.SetObject();
-        rapidjson::Document::AllocatorType& allocator = getConfig().config.GetAllocator();
-        getConfig().config.AddMember("Offset", 0, allocator);
-        getConfig().Write();
-        if(fileexists("sdcard/Android/data/com.beatgames.beatsaber/files/mod_cfgs/Replay.json")) {
-            log("Config was successfully created");
-        }
-    } else {
-        getConfig().Load();
-        log("Not creating config");
+void handleReplayLine(ReplayLine *replayLineToHandle) {
+    // replayLines.push_back(replayLineToHandle); //TODO: Remove all other vectors and only use this one!
+    rightPositions.push_back(replayLineToHandle->rightPosition);
+    rightRotations.push_back(replayLineToHandle->rightRotation);
+    leftPositions.push_back(replayLineToHandle->leftPosition);
+    leftRotations.push_back(replayLineToHandle->leftRotation);
+    headPositions.push_back(replayLineToHandle->headPosition);
+    if (times.size() < 1) {
+        shouldSkip = true;
+        skipTime = replayLineToHandle->time;
     }
+    times.push_back(replayLineToHandle->time);
+    scores.push_back(replayLineToHandle->score);
+    combos.push_back(replayLineToHandle->combo);
+    energies.push_back(replayLineToHandle->energy);
+    //ranks.push_back(replayLineToHandle.rank);
 }
+
+void handleSongInfo(SongInfo *songInfoToHandle) {
+
+    batteryEnergy = songInfoToHandle->batteryEnergy;
+    disappearingArrows = songInfoToHandle->disappearingArrows;
+    noObstacles = songInfoToHandle->noObstacles;
+    noBombs = songInfoToHandle->noBombs;
+    noArrows = songInfoToHandle->noArrows;
+    slowerSong = songInfoToHandle->slowerSong;
+    noFail = songInfoToHandle->noFail;
+    instafail = songInfoToHandle->instafail;
+    ghostNotes = songInfoToHandle->ghostNotes;
+    fasterSong = songInfoToHandle->fasterSong;
+    leftHanded = songInfoToHandle->leftHanded;
+}
+
 
 void getReplayValues(std::string str) {
     rightPositions.clear();
@@ -283,6 +365,67 @@ void getReplayValues(std::string str) {
     energies.clear();
     combos.clear();
     ranks.clear();
+    for (unsigned i = 0; i < str.length(); i += 80) {
+        std::string toDeserialize = str.substr(i, 80);
+        auto deserialized = cista::deserialize<ReplayLine>(toDeserialize);
+        handleReplayLine(deserialized);
+    }
+}
+
+void onIncomingMsg(std::string msg) {
+    auto packet = cista::deserialize<Packet>(msg);
+    if (packet->type == 1) {
+        auto songInfo = cista::deserialize<SongInfo>(packet->data);
+        // TODO REWORK AFTER NEW PACKET FORMAT
+        //playingLevel = songInfo->SongHash0;
+        if (playingLevel > 0) {
+            handleSongInfo(songInfo);
+        }
+    } else if (spectating) {
+        auto replayLine = cista::deserialize<ReplayLine>(packet->data);
+        handleReplayLine(replayLine);
+        if(playButton != nullptr) {
+            if (!playing) {
+                playing = true;
+            }
+        }
+        if (playing) {
+            lineCount++;
+        }
+    }
+}
+
+void ClientThread() {
+    sck.bind("4321");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (sck.connect(spectatorIp, std::to_string(spectatorPort))) {
+        log("Connected!");
+        while(sck.is_connected()) {
+            auto data = sck.recv();
+            if (data.size() > 0) {
+                std::string currentPacket(data.begin(), data.end());
+                onIncomingMsg(currentPacket);
+            }
+        }
+    } else {
+        log("Couldn't connect to player");
+        return;
+    }   
+    
+}
+
+void spectateButtonOnClick() {
+    rightPositions.clear();
+    rightRotations.clear();
+    leftPositions.clear();
+    leftRotations.clear();
+    headPositions.clear();
+    scores.clear();
+    times.clear();
+    energies.clear();
+    combos.clear();
+    ranks.clear();
+    lineCount = 0;
 
     batteryEnergy = false;
     disappearingArrows = false;
@@ -299,79 +442,23 @@ void getReplayValues(std::string str) {
     score = 0;
     combo = 0;
     energy = 0.5f;
-    
-    int timesThrough = 0;
- 
-    std::stringstream ss;
- 
-    /* Storing the whole string into string stream */
-    ss << str;
- 
-    /* Running loop till the end of the stream */
-    std::string temp;
-    float floatFound;
-    int intFound;
-    std::string stringFound;
-    Vector3 tempVector;
-    while (!ss.eof()) {
- 
-        /* extracting word by word from stream */
-        ss >> temp;
- 
-        /* Checking the given word is integer or not */
-        if (std::stringstream(temp) >> floatFound) {
-            if(timesThrough%amountPerLine == 0 || timesThrough%amountPerLine == 3 || timesThrough%amountPerLine == 6 || timesThrough%amountPerLine == 9 || timesThrough%amountPerLine == 15) {
-                tempVector.x = floatFound;
-            } else if(timesThrough%amountPerLine == 1 || timesThrough%amountPerLine == 4 || timesThrough%amountPerLine == 7 || timesThrough%amountPerLine == 10 || timesThrough%amountPerLine == 16) {
-                tempVector.y = floatFound;
-            } else if(timesThrough%amountPerLine == 2 || timesThrough%amountPerLine == 5 || timesThrough%amountPerLine == 8 || timesThrough%amountPerLine == 11 || timesThrough%amountPerLine == 17) {
-                tempVector.z = floatFound;
-                if(timesThrough%amountPerLine == 2) {
-                    rightPositions.push_back(tempVector);
-                } else if(timesThrough%amountPerLine == 5) {
-                    rightRotations.push_back(tempVector);
-                } else if(timesThrough%amountPerLine == 8) {
-                    leftPositions.push_back(tempVector);
-                } else if(timesThrough%amountPerLine == 11) {
-                    leftRotations.push_back(tempVector);
-                } else if(timesThrough%amountPerLine == 17) {
-                    headPositions.push_back(tempVector);
-                }
-            } else if(timesThrough%amountPerLine == 13) {
-                times.push_back(floatFound);
-            } else if(timesThrough%amountPerLine == 14) {
-                energies.push_back(floatFound);
-            }
-        }
-        if(timesThrough%amountPerLine == 19) {
-            log(temp);
-            ranks.push_back(temp);
-            // timesThrough++;
-        }
-        if(std::stringstream(temp) >> intFound) {
-            if(timesThrough%amountPerLine == 12) {
-                scores.push_back(intFound);
-            } else if(timesThrough%amountPerLine == 18) {
-                combos.push_back(intFound);
-            }
-            timesThrough++;
-        }
-        if(temp == "batteryEnergy") batteryEnergy = true;
-        if(temp == "disappearingArrows") disappearingArrows = true;
-        if(temp == "noObstacles") noObstacles = true;
-        if(temp == "noBombs") noBombs = true;
-        if(temp == "noArrows") noArrows = true;
-        if(temp == "slowerSong") slowerSong = true;
-        if(temp == "noFail") noFail = true;
-        if(temp == "instafail") instafail = true;
-        if(temp == "ghostNotes") ghostNotes = true;
-        if(temp == "fasterSong") fasterSong = true;
-        if(temp == "slowerSong") slowerSong = true;
-        if(temp == "leftHanded") leftHanded = true;
- 
-        /* To save from space at the end of string */
-        temp = "";
-    }
+
+    //TODO: Rework after new PACKET Format
+    // if (playingLevel > 0) {
+    //     std::hash<std::string> hash_fn;
+    //     size_t hashToCheck = hash_fn(songHash);
+    //     if (playingLevel == hashToCheck) {
+    //         if(fileexists("sdcard/Android/data/com.beatgames.beatsaber/files/mods/libScoreSaber.so")) {
+    //             setenv("disable_ss_upload", "1", true);
+    //         }
+    //         if(playButton != nullptr) {
+    //             spectating = true;
+    //             recording = false;
+    //             log("pressing play");
+    //             RunMethod(playButton, "Press");
+    //         }
+    //     }
+    // }
 }
 
 float lerp(float a, float b, float t) {
@@ -393,44 +480,49 @@ float lerp(float a, float b, float t) {
 }
 
 Vector3 lerpVectors(Vector3 a, Vector3 b, float t) {
-    
-    // Vector3 newVector = *RunMethod<Vector3>("UnityEngine", "Vector3", "Lerp", a, b, t);
     Vector3 newVector = {0, 0, 0};
     newVector.x = lerp(a.x, b.x, t);
     newVector.y = lerp(a.y, b.y, t);
     newVector.z = lerp(a.z, b.z, t);
-
-    log("A vector is: "+std::to_string(a.x)+", "+std::to_string(a.y)+", "+std::to_string(a.z)+". B vector is: "+std::to_string(b.x)+", "+std::to_string(b.y)+", "+std::to_string(b.z)+". New vector is: "+std::to_string(newVector.x)+", "+std::to_string(newVector.y)+", "+std::to_string(newVector.z)+", lerp amount is "+std::to_string(t));
-
     return a;
 }
 
 bool hasFakeMiss() {
     int amountCheckingEachSide = 2;
-
     int biggestCombo = 0;
-
-    // if(indexNum < amountCheckingEachSide) {
-    //     for(int i = 0; i < (indexNum+1)+amountCheckingEachSide; i++) {
-    //         if(combos[i] > biggestCombo) {
-    //             biggestCombo = combos[i];
-    //         } else if(combos[i] < biggestCombo) {
-    //             return false;
-    //         }
-    //     }
-    // } else {
-        for(int i = -amountCheckingEachSide; i < (amountCheckingEachSide*2)+1; i++) {
-            if(combos[indexNum+i] <= 1) {
-                return false;
-            }
+    for(int i = -amountCheckingEachSide; i < (amountCheckingEachSide*2)+1; i++) {
+        if(combos[indexNum+i] <= 1) {
+            return false;
         }
-    // }
-
+    }
     return true;
 }
 
+SongInfo getSongInfo() {
+    unsigned char hash[20];
+    std::transform(songHash.begin(), songHash.end(),songHash.begin(), ::toupper); //Making sure the song LEVELID is in uppercase on both PC and Quest for easier searching
+    sha1::calc(songHash.c_str(),songHash.length(),hash);
+    std::string songSha1( hash, hash + sizeof hash / sizeof hash[0] ); //Using SHA1 allows me to make sure the Hash is always the same size for packet padding.
+    char hexstring[41];
+    sha1::toHexString(hash, hexstring);
+
+    SongInfo songInfo{batteryEnergy, disappearingArrows, noObstacles, noBombs, noArrows, slowerSong, noFail, instafail, ghostNotes, fasterSong, leftHanded, songDifficulty, mode, songSha1 + "00000000000000000000"}; // the 0's are for Padding the SongInfo to 104B, TODO implement it in the struct directly
+    return songInfo;
+}
+
+MAKE_HOOK_OFFSETLESS(SceneManager_SetActiveScene, bool, Scene scene) {
+    if (!threadStarted) {
+        threadStarted = true;
+        std::thread socketThread(SocketThread); //Starting Server
+        socketThread.detach();
+        std::thread clientThread(ClientThread); // Starting Client
+        clientThread.detach();
+    }
+    return SceneManager_SetActiveScene(scene);
+}
+
 MAKE_HOOK_OFFSETLESS(PlayerController_Update, void, Il2CppObject* self) {
-    // log("PlayerControllerUpdate");
+    // When Playing
     if(recording) {
         Il2CppObject* leftSaber = *il2cpp_utils::GetFieldValue(self, "_leftSaber");
         Il2CppObject* rightSaber = *il2cpp_utils::GetFieldValue(self, "_rightSaber");
@@ -449,13 +541,21 @@ MAKE_HOOK_OFFSETLESS(PlayerController_Update, void, Il2CppObject* self) {
                 Vector3 leftPos = *RunMethod<Vector3>(leftSaberTransform, "get_position");
                 Vector3 leftRot = *RunMethod<Vector3>(leftSaberTransform, "get_eulerAngles");
                 Vector3 headPos = *GetFieldValue<Vector3>(self, "_headPos");
-                stringToSave = stringToSave+std::to_string(rightPos.x)+" "+std::to_string(rightPos.y)+" "+std::to_string(rightPos.z)+" "+std::to_string(rightRot.x)+" "+std::to_string(rightRot.y)+" "+std::to_string(rightRot.z)+" "+std::to_string(leftPos.x)+" "+std::to_string(leftPos.y)+" "+std::to_string(leftPos.z)+" "+std::to_string(leftRot.x)+" "+std::to_string(leftRot.y)+" "+std::to_string(leftRot.z)+" "+std::to_string(score)+" "+std::to_string(songTime)+" "+std::to_string(energy)+" "+std::to_string(headPos.x)+" "+std::to_string(headPos.y)+" "+std::to_string(headPos.z)+" "+std::to_string(combo)+" "+rank+" ";
+                ReplayLine replayLine{rightPos, rightRot, leftPos, leftRot,headPos, score, combo, songTime, energy, rankFloat}; //Initiating a replay line with current values
+                std::vector<uint8_t> buf = cista::serialize(replayLine);
+                std::string replayLineStr(buf.begin(), buf.end());
+                Packet packet{0, replayLineStr}; //Making a ReplayLine Packet
+                std::vector<uint8_t> bufPacket = cista::serialize(packet);
+                std::string packetStr(bufPacket.begin(), bufPacket.end());
+                server.sendToAllClients(packetStr.c_str(), packetStr.length()); //Sending the ReplayLine Packet to spectators
             }
         }
     }
 
     PlayerController_Update(self);
+    
 
+    // When Spectating
     if(!recording) {
         bool foundCorrectIndex = false;
         while(!foundCorrectIndex) {
@@ -476,7 +576,6 @@ MAKE_HOOK_OFFSETLESS(PlayerController_Update, void, Il2CppObject* self) {
         } else if(lerpAmount < 0) {
             lerpAmount = 0;
         }
-        // log("Lerp amount is "+std::to_string(lerpAmount));
 
         Il2CppObject* leftSaber = *il2cpp_utils::GetFieldValue(self, "_leftSaber");
         Il2CppObject* rightSaber = *il2cpp_utils::GetFieldValue(self, "_rightSaber");
@@ -488,7 +587,6 @@ MAKE_HOOK_OFFSETLESS(PlayerController_Update, void, Il2CppObject* self) {
             Il2CppClass* componentsClass = il2cpp_utils::GetClassFromName("", "Saber");
             leftSaberTransform = *il2cpp_utils::RunMethod(leftSaber, il2cpp_functions::class_get_method_from_name(componentsClass, "get_transform", 0));
             rightSaberTransform = *il2cpp_utils::RunMethod(rightSaber, il2cpp_functions::class_get_method_from_name(componentsClass, "get_transform", 0));
-
             if(leftSaberTransform != nullptr && rightSaberTransform != nullptr) {
                 CRASH_UNLESS(RunMethod(rightSaberTransform, "set_position", lerpVectors(rightPositions[indexNum], rightPositions[indexNum], lerpAmount)));
                 CRASH_UNLESS(RunMethod(rightSaberTransform, "set_eulerAngles", lerpVectors(rightRotations[indexNum], rightRotations[indexNum], lerpAmount)));
@@ -501,87 +599,95 @@ MAKE_HOOK_OFFSETLESS(PlayerController_Update, void, Il2CppObject* self) {
 }
 
 MAKE_HOOK_OFFSETLESS(SongUpdate, void, Il2CppObject* self) {
-    
-    // log("SongUpdate");
-
-    if(!recording && !speedToggle.toggle) {
-        replaySpeed+=rTriggerVal/500;
-        replaySpeed-=lTriggerVal/500;
-
-        if(replaySpeed < 0.01f) {
-            replaySpeed = 0.01f;
-        }
-        
-        if(!inPauseMenu) {
-            float roundedReplaySpeed = (float(int(replaySpeed*100)))/100;
-
-            // log("Rounded replay speed is "+std::to_string(roundedReplaySpeed));
-
-            SetFieldValue(self, "_timeScale", (float(int(replaySpeed*100)))/100);
-            Il2CppObject* audioSource = *GetFieldValue(self, "_audioSource");
-            RunMethod(audioSource, "set_pitch", (float(int(replaySpeed*100)))/100);
+    // When Spectating
+    if (!recording) {
+        float lastTime = times[times.size() - 1];
+        float delay = lastTime - songTime;
+        float speed = 1.00;
+        float nullSpeed = 0.00;
+        float minDelay = 0.50;
+        float safeDelay = 3.00;
+        int pauseCheck = times.size() - indexNum;
+        Il2CppObject* audioSource = *GetFieldValue(self, "_audioSource");
+        if (playingLevel > 0 && delay < minDelay) {
+            SetFieldValue(self, "_timeScale", nullSpeed);
+            RunMethod(audioSource, "set_pitch", nullSpeed);
+            waiting = true;
+        } 
+        if (waiting && delay > safeDelay) {
+            SetFieldValue(self, "_timeScale", speed);
+            RunMethod(audioSource, "set_pitch", speed);
+            waiting = false;
+        } else if (playingLevel == 0) {
+            SetFieldValue(self, "_timeScale", speed);
+            RunMethod(audioSource, "set_pitch", speed);
+            waiting = false;
         }
     }
-
+    
     SongUpdate(self);
-
     songTime = *il2cpp_utils::GetFieldValue<float>(self, "_songTime");
 }
 
-MAKE_HOOK_OFFSETLESS(SongStart, void, Il2CppObject* self, Il2CppObject* difficultyBeatmap, Il2CppObject* overrideEnvironmentSettings, Il2CppObject* overrideColorScheme, Il2CppObject* gameplayModifiers, Il2CppObject* playerSpecificSettings, Il2CppObject* practiceSettings, Il2CppString* backButtonText, bool useTestNoteCutSoundEffects) {
+MAKE_HOOK_OFFSETLESS(SongAudioStart, void, Il2CppObject* self) {
+    // To skip song to the first ReplayLine data received, for close to no delay.
+    if (shouldSkip) {
+        shouldSkip = false;
+        Il2CppObject* initData = CRASH_UNLESS(*GetFieldValue(self, "_initData"));
+        SetFieldValue(initData, "startSongTime", skipTime);
+    }
+    SongAudioStart(self);
+}
 
-    log("Song Start");
+MAKE_HOOK_OFFSETLESS(SongStart, void, Il2CppObject* self, Il2CppObject* difficultyBeatmap, Il2CppObject* overrideEnvironmentSettings, Il2CppObject* overrideColorScheme, Il2CppObject* gameplayModifiers, Il2CppObject* playerSpecificSettings, Il2CppObject* practiceSettings, Il2CppString* backButtonText, bool useTestNoteCutSoundEffects) {
 
     energy = 0.5f;
     inSong = true;
     inSongOrResults = true;
     indexNum = 0;
-    replaySpeed = 1.0f;
     
+    // When Playing
     if(recording) {
         stringToSave = "";
 
         batteryEnergy = *RunMethod<bool>(gameplayModifiers, "get_batteryEnergy");
-        if(batteryEnergy) stringToSave = stringToSave+"batteryEnergy ";
 
         disappearingArrows = *RunMethod<bool>(gameplayModifiers, "get_disappearingArrows");
-        if(disappearingArrows) stringToSave = stringToSave+"disappearingArrows ";
 
         ghostNotes = *RunMethod<bool>(gameplayModifiers, "get_ghostNotes");
-        if(ghostNotes) stringToSave = stringToSave+"ghostNotes ";
 
         instafail = *RunMethod<bool>(gameplayModifiers, "get_instaFail");
-        if(instafail) stringToSave = stringToSave+"instafail ";
 
         noArrows = *RunMethod<bool>(gameplayModifiers, "get_noArrows");
-        if(noArrows) stringToSave = stringToSave+"noArrows ";
 
         noBombs = *RunMethod<bool>(gameplayModifiers, "get_noBombs");
-        if(noBombs) stringToSave = stringToSave+"noBombs ";
 
         noFail = *RunMethod<bool>(gameplayModifiers, "get_noFail");
-        if(noFail) stringToSave = stringToSave+"noFail ";
 
         noObstacles = *RunMethod<bool>(gameplayModifiers, "get_noObstacles");
-        if(noObstacles) stringToSave = stringToSave+"noObstacles ";
 
         int songSpeedLevel = *RunMethod<int>(gameplayModifiers, "get_songSpeed");
+
         slowerSong = false;
         fasterSong = false;
         if(songSpeedLevel == 1) {
             fasterSong = true;
-            stringToSave = stringToSave+"fasterSong ";
         } else if(songSpeedLevel == 2) {
             slowerSong = true;
-            stringToSave = stringToSave+"slowerSong ";
         }
 
         leftHanded = *RunMethod<bool>(playerSpecificSettings, "get_leftHanded");
-        if(leftHanded) stringToSave = stringToSave+"leftHanded ";
-    } else {
-        stringToSave = readfile(replayDirectory+songHash+".txt");
-        getReplayValues(stringToSave);
+        SongInfo songInfo = getSongInfo();
+        currentSongInfo = songInfo;
 
+        std::vector<uint8_t> buf = cista::serialize(songInfo);
+        std::string songInfoStr(buf.begin(), buf.end());
+        Packet packet{1, songInfoStr}; // Making a SongInfo Packet
+        std::vector<uint8_t> bufPacket = cista::serialize(packet);
+        std::string packetStr(bufPacket.begin(), bufPacket.end());
+        stringToSave = stringToSave + packetStr;
+        server.sendToAllClients(packetStr.c_str(), packetStr.length()); //Sending the SongInfo Packet to spectators
+    } else { // When Spectating
         RunMethod(gameplayModifiers, "set_batteryEnergy", batteryEnergy);
         RunMethod(gameplayModifiers, "set_disappearingArrows", disappearingArrows);
         RunMethod(gameplayModifiers, "set_ghostNotes", ghostNotes);
@@ -593,43 +699,38 @@ MAKE_HOOK_OFFSETLESS(SongStart, void, Il2CppObject* self, Il2CppObject* difficul
         RunMethod(playerSpecificSettings, "set_leftHanded", leftHanded);
     }
 
-    inPauseMenu = false;
-
-    speedToggle.destroy();
-
     SongStart(self, difficultyBeatmap, overrideEnvironmentSettings, overrideColorScheme, gameplayModifiers, playerSpecificSettings, practiceSettings, backButtonText, useTestNoteCutSoundEffects);
 }
 
 MAKE_HOOK_OFFSETLESS(SongEnd, void, Il2CppObject* self, Il2CppObject* levelCompleteionResults) {
     
     log("SongEnd");
-
+    shouldSkip = false;
+    if (recording) {
+        SongInfo songInfo{};
+        currentSongInfo = songInfo;
+        std::vector<uint8_t> buf = cista::serialize(songInfo);
+        std::string songInfoStr(buf.begin(), buf.end());
+        Packet packet{1, songInfoStr};
+        std::vector<uint8_t> bufPacket = cista::serialize(packet);
+        std::string packetStr(bufPacket.begin(), bufPacket.end());
+        //server.sendToAllClients(packetStr.c_str(), packetStr.length());  //This line is ment for Quest to Quest spectating, commented because of conflict with PC for now
+    }
     if(!recording && fileexists("sdcard/Android/data/com.beatgames.beatsaber/files/mods/libScoreSaber.so")) {
         setenv("disable_ss_upload", "1", true);
     }
 
+    spectating = false;
+    playing = false;
+
     inSong = false;
 
-    if(replayText.gameObj != nullptr) {
-        log("Destroying replay text");
-        replayText.destroy();
+    if(spectateText.gameObj != nullptr) {
+        log("Destroying spectate text");
+        spectateText.destroy();
     }
 
     int levelEndState = *GetFieldValue<int>(levelCompleteionResults, "levelEndStateType");
-
-    log("Level end state is "+std::to_string(levelEndState));
-
-    if(recording && levelEndState == 1 && !inPracticeMode) {
-        if(score > highScore || !fileexists(replayDirectory+songHash+".txt")) {
-            writefile(replayDirectory+songHash+".txt", stringToSave);
-        } else {
-            stringToSave = readfile(replayDirectory+songHash+".txt");
-            getReplayValues(stringToSave);
-            if(score > scores[scores.size()-1]) {
-                writefile(replayDirectory+songHash+".txt", stringToSave);
-            }
-        }
-    }
     
     SongEnd(self, levelCompleteionResults);
 
@@ -637,9 +738,7 @@ MAKE_HOOK_OFFSETLESS(SongEnd, void, Il2CppObject* self, Il2CppObject* levelCompl
 }
 
 MAKE_HOOK_OFFSETLESS(ScoreChanged, void, Il2CppObject* self, int rawScore, int modifiedScore) {
-
-    // log("Score Changed");
-    
+    // When Playing
     if(!recording) {
         rawScore = scores[indexNum];
         modifiedScore = rawScore * scoreMultiplier;
@@ -661,18 +760,7 @@ MAKE_HOOK_OFFSETLESS(RefreshContent, void, Il2CppObject* self) {
 
         if(fileexists("sdcard/Android/data/com.beatgames.beatsaber/files/mods/libScoreSaber.so")) {
             log("Score saber is loaded");
-            // if(firstTime) {
-            //     log("Getting ss");
-            //     char* temp = getenv("disable_ss_upload");
-            //     std::string tempString(temp);
-            //     // ssEnabled = std::string(getenv("disable_ss_upload"));
-            //     log(std::string(tempString));
-            //     firstTime = false;
-            // } else if(ssEnabled == "0") {
-                setenv("disable_ss_upload", "0", true);
-            // } else {
-            //     setenv("disable_ss_upload", "1", true);
-            // }
+            setenv("disable_ss_upload", "0", true);
         }
     }
 
@@ -692,41 +780,55 @@ MAKE_HOOK_OFFSETLESS(RefreshContent, void, Il2CppObject* self) {
     highScore = *GetPropertyValue<int>(playerLevelStatsData, "highScore");
     log("Highscore is "+std::to_string(highScore));
 
-    songHash = to_utf8(csstrtostr(LevelID))+std::to_string(Difficulty)+modeName;
-
-    replayButton.destroy();
-
-    if(fileexists(replayDirectory+songHash+".txt")) {
-        log("Making Replay button");
-        replayButton.setParentAndTransform(playButton, 1);
-        replayButton.onPress = replayButtonOnClick;
-        replayButton.scale = {1, 1, 1};
-        replayButton.fontSize = 5;
-        replayButton.create();
-        if(replayButton.TMPLocalizer != nullptr) {
-            RunMethod("UnityEngine", "Object", "Destroy", replayButton.TMPLocalizer);
-        }
-        replayButton.setText("Replay");
-    } else {
-        log("Not making Replay button");
+    mode = 0;
+    if (modeName == "OneSaber") {
+        mode = 1;
+    } else if (modeName == "NoArrows") {
+        mode = 2;
+    } else if (modeName == "360Degree") {
+        mode = 3;
+    } else if (modeName == "90Degree") {
+        mode = 4;
     }
+    songHash = to_utf8(csstrtostr(LevelID));
+    songDifficulty = Difficulty;
+
+    spectateButton.destroy();
 
     Il2CppObject* songNameText = *GetFieldValue(self, "_songNameText");
     songName = to_utf8(csstrtostr(*RunMethod<Il2CppString*>(songNameText, "get_text")));
+
+    if (playingLevel > 0) {
+        std::hash<std::string> hash_fn;
+        size_t hashToCheck = hash_fn(songHash);
+        if (playingLevel == hashToCheck) {
+            log("Making Spectate button");
+            spectateButton.setParentAndTransform(playButton, 1);
+            spectateButton.onPress = spectateButtonOnClick;
+            spectateButton.scale = {1, 1, 1};
+            spectateButton.fontSize = 5;
+            spectateButton.create();
+            if(spectateButton.TMPLocalizer != nullptr) {
+                RunMethod("UnityEngine", "Object", "Destroy", spectateButton.TMPLocalizer);
+            }
+            spectateButton.setText("Spectate");
+        }
+    } else {
+       log("Not making Spectate button");
+    }
+
     log("Song name is "+songName);
 }
 
 MAKE_HOOK_OFFSETLESS(LevelSelectionFlowCoordinator_StartLevel, void, Il2CppObject* self, Il2CppObject* difficultyBeatmap, Il2CppObject* beforeSceneSwitchCallback, bool practice) {
     
-    // log("StartLevel");
+    log("StartLevel");
 
     inPracticeMode = practice;
     LevelSelectionFlowCoordinator_StartLevel(self, difficultyBeatmap, beforeSceneSwitchCallback, practice);
 }
 
 MAKE_HOOK_OFFSETLESS(EnergyBarUpdate, void, Il2CppObject* self, int value) {
-    
-    // log("EnergyBarUpdate");
 
     if(!recording) {
         value = 0;
@@ -747,8 +849,6 @@ MAKE_HOOK_OFFSETLESS(EnergyBarUpdate, void, Il2CppObject* self, int value) {
 
 MAKE_HOOK_OFFSETLESS(ScoreControllerLateUpdate, void, Il2CppObject* self) {
 
-    // log("ScoreControllerLateUpdate");
-
     ScoreControllerLateUpdate(self);
 
     scoreMultiplier = *GetFieldValue<float>(self, "_gameplayModifiersScoreMultiplier");
@@ -768,17 +868,12 @@ MAKE_HOOK_OFFSETLESS(RefreshRank, void, Il2CppObject* self) {
 
     RefreshRank(self);
 
-    Il2CppObject* percentText = *GetFieldValue(self, "_relativeScoreText");
-
-    if(!recording) {
-        RunMethod(percentText, "SetText", createcsstr(ranks[indexNum+1]));
-    } else {
-        rank = to_utf8(csstrtostr(*RunMethod<Il2CppString*>(percentText, "get_text")));
+    if(recording) {
+        rankFloat = *GetFieldValue<float>(self, "_prevRelativeScore");
     }
 }
 
 MAKE_HOOK_OFFSETLESS(Triggers, void, Il2CppObject* self, int node) {
-
     triggerNode = node;
 
     Triggers(self, node);
@@ -794,82 +889,36 @@ MAKE_HOOK_OFFSETLESS(ControllerUpdate, void, Il2CppObject* self) {
     if (triggerNode == 5) {
         rTriggerVal = trigger;
     }
-
     ControllerUpdate(self);
 }
 
 MAKE_HOOK_OFFSETLESS(ProgressUpdate, void, Il2CppObject* self) {
-    
-    // log("Progress update");
-
+    // When spectating
     if(!recording) {
-        std::string tempString = std::to_string(replaySpeed);
-        tempString.erase(4, tempString.length()-1);
-        std::string textToSetTo = "Watching "+songName+" at "+tempString+"x speed";
-        if(speedToggle.toggle && tempString == "1.00") {
-            textToSetTo = "Watching a Replay of "+songName;
-        }
+        std::string textToSetTo = "Spectating "+songName;
 
-        if(replayText.gameObj == nullptr && inSong) {
-            log("Making replayText");
+        if(spectateText.gameObj == nullptr && inSong) {
+            log("Making spectateText");
             Il2CppObject* slider = *il2cpp_utils::GetFieldValue(self, "_slider");
             Il2CppObject* sliderTransform = *il2cpp_utils::RunMethod(slider, "get_transform");
             Il2CppObject* sliderParent = *il2cpp_utils::RunMethod(sliderTransform, "GetParent");
     
-            replayText.text = textToSetTo;
-            replayText.fontSize = 12.0f;
-            replayText.parentTransform = sliderParent;
-            replayText.sizeDelta = {-400, 100};
-            replayText.anchoredPosition = {-400, 100};
-            replayText.create();
+            spectateText.text = textToSetTo;
+            spectateText.fontSize = 12.0f;
+            spectateText.parentTransform = sliderParent;
+            spectateText.sizeDelta = {-400, 100};
+            spectateText.anchoredPosition = {-400, 100};
+            spectateText.create();
         } else {
             if(inSong) {
-                replayText.set(textToSetTo);
+                spectateText.set(textToSetTo);
             }
         }
     }
- 
     ProgressUpdate(self);
 }
 
-MAKE_HOOK_OFFSETLESS(PauseStart, void, Il2CppObject* self) {
-
-    PauseStart(self);
-
-    inPauseMenu = true;
-
-    if(!recording) {
-        Il2CppObject* continueButton = CRASH_UNLESS(*GetFieldValue(self, "_continueButton"));
-
-        speedToggle.setParentAndTransform(continueButton, 2);
-        if(speedToggle.toggle) {
-            speedToggle.text = "Lock Speed - ON";
-        } else {
-            speedToggle.text = "Lock Speed - OFF";
-        }
-        speedToggle.fontSize = 4.3f;
-        speedToggle.scale = {1, 1, 1};
-        speedToggle.sizeDelta = {0, -28, 0};
-        speedToggle.onPress = speedToggleOnClick;
-        speedToggle.create();
-        if(speedToggle.TMPLocalizer != nullptr) {
-            RunMethod("UnityEngine", "Object", "Destroy", speedToggle.TMPLocalizer);
-        }
-        RunMethod(speedToggle.TMP, "set_enableWordWrapping", false);
-    }
-}
-
-MAKE_HOOK_OFFSETLESS(PauseFinish, void, Il2CppObject* self) {
-
-    PauseFinish(self);
-
-    inPauseMenu = false;
-
-    log("PauseFinish");
-}
-
 MAKE_HOOK_OFFSETLESS(PauseMenuManager_MenuButtonPressed, void, Il2CppObject* self) {
-
     PauseMenuManager_MenuButtonPressed(self);
 
     inSongOrResults = false;
@@ -885,7 +934,6 @@ MAKE_HOOK_OFFSETLESS(ResultsScreenEnd, void, Il2CppObject* self, int deactivatio
 }
 
 MAKE_HOOK_OFFSETLESS(NoteWasMissed, void, Il2CppObject* self) {
-
     if(!recording && hasFakeMiss()) {
         return;
     }
@@ -894,7 +942,6 @@ MAKE_HOOK_OFFSETLESS(NoteWasMissed, void, Il2CppObject* self) {
 }
 
 MAKE_HOOK_OFFSETLESS(NoteWasCut, void, Il2CppObject* self, Il2CppObject* noteCutInfo) {
-
     bool allIsOk = *RunMethod<bool>(noteCutInfo, "get_allIsOK");
 
     if(!recording && !allIsOk && hasFakeMiss()) {
@@ -904,20 +951,74 @@ MAKE_HOOK_OFFSETLESS(NoteWasCut, void, Il2CppObject* self, Il2CppObject* noteCut
     NoteWasCut(self, noteCutInfo);
 }
 
+MAKE_HOOK_OFFSETLESS(VRCenterAdjust_Enable, void, Il2CppObject* self) {
+    Vector3 newCenter = {0, 0, -3.0f};
+    if(!inSong || !spectating) {
+        newCenter.z = 0;
+    }
+    Il2CppObject* currentRoomCenter = *GetFieldValue(self, "_roomCenter");
+    il2cpp_utils::RunMethod(currentRoomCenter, "set_value", newCenter);
+    VRCenterAdjust_Enable(self);
+}
+
+void SaveConfig() {
+    getConfig().config.RemoveAllMembers();
+    getConfig().config.SetObject();
+    rapidjson::Document::AllocatorType& allocator = getConfig().config.GetAllocator();
+    getConfig().config.AddMember("spectatorIp", "111.111.111.111", allocator);
+    getConfig().config.AddMember("spectatorPort", 65123, allocator);
+    getConfig().config.AddMember("serverPort", 65122, allocator);
+    getConfig().Write();
+}   
+
+bool LoadConfig() {
+    getConfig().Load();
+    //return false;
+    bool foundEverything = true;
+    if (getConfig().config.HasMember("spectatorIp") && getConfig().config["spectatorIp"].IsString()) {
+        spectatorIp = getConfig().config["spectatorIp"].GetString();
+    }
+    else {
+        foundEverything = false;
+    }
+    if (getConfig().config.HasMember("spectatorPort") && getConfig().config["spectatorPort"].IsInt()) {
+        spectatorPort = getConfig().config["spectatorPort"].GetInt();
+    }
+    else {
+        foundEverything = false;
+    }
+    if (getConfig().config.HasMember("serverPort") && getConfig().config["serverPort"].IsInt()) {
+        serverPort = getConfig().config["serverPort"].GetInt();
+    }
+    else {
+        foundEverything = false;
+    }
+    if (foundEverything) {
+        return true;
+    }
+    return false;
+}
+
 extern "C" void setup(ModInfo& info) {
-    info.id = "Replay";
+    info.id = "Spectator";
     info.version = "0.1.2";
     modInfo = info;
-    // Create logger
     static std::unique_ptr<const Logger> ptr(new Logger(info));
     Logger::get().info("Completed setup!");
-    // We can even check information specific to the modloader!
     Logger::get().info("Modloader name: %s", Modloader::getInfo().name.c_str());
+    getConfig();
+    getConfig().Load();
+    getConfig().Write();
 }
 
 extern "C" void load() {
+    if(!LoadConfig())
+    {
+        SaveConfig();
+    }
     Logger::get().info("Installing hooks...");
     INSTALL_HOOK_OFFSETLESS(SongUpdate, il2cpp_utils::FindMethodUnsafe("", "AudioTimeSyncController", "Update", 0));
+    INSTALL_HOOK_OFFSETLESS(SongAudioStart, il2cpp_utils::FindMethodUnsafe("", "AudioTimeSyncController", "StartSong", 0));
     INSTALL_HOOK_OFFSETLESS(SongStart, il2cpp_utils::FindMethodUnsafe("", "StandardLevelScenesTransitionSetupDataSO", "Init", 8));
     INSTALL_HOOK_OFFSETLESS(SongEnd, il2cpp_utils::FindMethodUnsafe("", "StandardLevelScenesTransitionSetupDataSO", "Finish", 1));
     INSTALL_HOOK_OFFSETLESS(PlayerController_Update, il2cpp_utils::FindMethodUnsafe("", "PlayerController", "Update", 0));
@@ -930,17 +1031,12 @@ extern "C" void load() {
     INSTALL_HOOK_OFFSETLESS(Triggers, il2cpp_utils::FindMethodUnsafe("", "VRControllersInputManager", "TriggerValue", 1));
     INSTALL_HOOK_OFFSETLESS(ControllerUpdate, il2cpp_utils::FindMethodUnsafe("", "VRController", "Update", 0));
     INSTALL_HOOK_OFFSETLESS(ProgressUpdate, il2cpp_utils::FindMethodUnsafe("", "SongProgressUIController", "Update", 0));
-    INSTALL_HOOK_OFFSETLESS(PauseStart, il2cpp_utils::FindMethodUnsafe("", "PauseMenuManager", "Start", 0));
-    INSTALL_HOOK_OFFSETLESS(PauseFinish, il2cpp_utils::FindMethodUnsafe("", "PauseMenuManager", "StartResumeAnimation", 0));
     INSTALL_HOOK_OFFSETLESS(PauseMenuManager_MenuButtonPressed, il2cpp_utils::FindMethodUnsafe("", "PauseMenuManager", "MenuButtonPressed", 0));
     INSTALL_HOOK_OFFSETLESS(ResultsScreenEnd, il2cpp_utils::FindMethodUnsafe("", "ResultsViewController", "DidDeactivate", 1));
     INSTALL_HOOK_OFFSETLESS(NoteWasMissed, il2cpp_utils::FindMethodUnsafe("", "NoteController", "SendNoteWasMissedEvent", 0));
     INSTALL_HOOK_OFFSETLESS(NoteWasCut, il2cpp_utils::FindMethodUnsafe("", "NoteController", "SendNoteWasCutEvent",1));
+    INSTALL_HOOK_OFFSETLESS(SceneManager_SetActiveScene, il2cpp_utils::FindMethodUnsafe("UnityEngine.SceneManagement", "SceneManager", "SetActiveScene", 1));
+    INSTALL_HOOK_OFFSETLESS(VRCenterAdjust_Enable, il2cpp_utils::FindMethodUnsafe("", "VRCenterAdjust", "Start", 0));
     Logger::get().info("Installed all hooks!");
     il2cpp_functions::Init();
-
-    // SaveConfig();
-
-    std::string path = replayDirectory+"test.txt";
-    mkpath(const_cast<char*>(path.c_str()), 0700);
 }

@@ -49,11 +49,13 @@ LOCAL_SHARED_LIBRARIES := modloader
 LOCAL_SHARED_LIBRARIES += beatsaber-hook_TESTHOOK
 LOCAL_SHARED_LIBRARIES += CustomUI_2019_2_1f1_0_1_3
 LOCAL_LDLIBS     := -llog
-LOCAL_CFLAGS     := -D"MOD_ID=\"replay\"" -D"VERSION=\"0.1.0\"" -I"c:/Program Files/Unity/Hub/Editor/2019.3.2f1/Editor/Data/il2cpp/libil2cpp"
-LOCAL_MODULE     := replay
+LOCAL_CFLAGS     := -D"MOD_ID=\"spectator\"" -D"VERSION=\"0.1.0\"" -I"D:/Unity/Editors/2019.3.2f1/Editor/Data/il2cpp/libil2cpp"
+LOCAL_MODULE     := spectator
 LOCAL_CPPFLAGS   := -std=c++2a
 LOCAL_C_INCLUDES := ./include ./src
 LOCAL_SRC_FILES  += $(call rwildcard,src/,*.cpp) ./extern/beatsaber-hook/src/inline-hook/And64InlineHook.cpp
+LOCAL_SRC_FILES  += $(call rwildcard, extern/tcp_server_client-0.1/src,*.cpp)
+LOCAL_SRC_FILES  += $(call rwildcard, extern/sha1,*.cpp)
 include $(BUILD_SHARED_LIBRARY)
 
 # In order to make this mod work with BMBF, you must provide a zip file with the specific libbeatsaber-hook.so (file copied to the libs directory)

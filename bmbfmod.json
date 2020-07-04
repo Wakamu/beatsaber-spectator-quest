@@ -1,22 +1,22 @@
 {
-    "id": "Replay",
-    "name": "Replay",
-    "author": "Henwill8",
+    "id": "Spectator",
+    "name": "Spectator",
+    "author": "Wakamu",
     "description": [
         
     ],
     "category": "Gameplay",
     "gameVersion": "1.10.0",
-    "version": "0.2.0",
+    "version": "0.0.1",
     "platform": "Quest",
     "components": [
         {
             "type": "HookMod",
             "installAction": {
-                "installLibraryFile": "libreplay.so"
+                "installLibraryFile": "libspectator.so"
             },
             "uninstallAction": {
-                "removeLibraryFile": "libreplay.so"
+                "removeLibraryFile": "libspectator.so"
             }
         },
         {
