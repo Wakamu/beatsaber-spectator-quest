@@ -2,3 +2,9 @@
 	path = extern/beatsaber-hook
 	url = https://github.com/sc2ad/beatsaber-hook.git
 	branch = so-update
+[submodule "extern/BeatSaberQuestCustomUI"]
+	path = extern/BeatSaberQuestCustomUI
+	url = https://github.com/sc2ad/BeatSaberQuestCustomUI.git
+[submodule "extern/cpp-base64"]
+	path = extern/cpp-base64
+	url = https://github.com/ReneNyffenegger/cpp-base64.git
