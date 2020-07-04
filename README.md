@@ -1,4 +1,4 @@
-# Spectator
+# Spectator (Based on Replay mod by Henwill8)
 
 ## Credits
 
